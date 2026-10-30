@@ -1,0 +1,16 @@
+# 依赖
+node_modules/
+
+# 开发期临时文件（不发布）
+_research/
+_patch*.py
+client.v012.bak.js
+debug.log
+*.log
+
+# 系统/编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

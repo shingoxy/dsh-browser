@@ -1,0 +1,56 @@
+{
+  "name": "dsh-browser",
+  "version": "0.2.8",
+  "description": "Let DeepSeek Harness talk to web-based AI (ChatGPT, Claude, Gemini, ...) inside an embedded browser: read the conversation, save generated markdown/images, and ask questions with explicit user approval.",
+  "type": "module",
+  "main": "index.js",
+  "icon": "./icon.svg",
+  "meta": {
+    "title": "DSH Browser",
+    "description": "Embed a web AI page, read its replies, save generated files/images, and ask questions with approval."
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "locale/*.json",
+    "icon.svg",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.1-rc.2 <0.3.0"
+  },
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "chatgpt",
+    "webview",
+    "browser",
+    "sidechat"
+  ],
+  "scripts": {
+    "check": "node --check index.js && node --check client.js",
+    "prepack": "npm run check"
+  }
+}
