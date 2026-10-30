@@ -1,6 +1,6 @@
 {
   "name": "dsh-browser",
-  "version": "0.2.8",
+  "version": "0.3.4",
   "description": "Let DeepSeek Harness talk to web-based AI (ChatGPT, Claude, Gemini, ...) inside an embedded browser: read the conversation, save generated markdown/images, and ask questions with explicit user approval.",
   "type": "module",
   "main": "index.js",
@@ -24,7 +24,8 @@
     "README.md",
     "locale/*.json",
     "icon.svg",
-    "LICENSE"
+    "LICENSE",
+    "chrome.js"
   ],
   "dsh": {
     "bundle": {

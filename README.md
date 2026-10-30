@@ -100,6 +100,28 @@ webai action=layout mode=right
   另外，在系统 Chrome 里先登录 ChatGPT 再回面板也没用——面板分区独立，读不到系统浏览器的 Cookie。
 - 网页里的 `window.open` 弹窗会被转发到面板自身打开，不会跑到独立窗口。
 
+## 控制台模式（真实 Chrome）
+
+内嵌 webview 绕不过 Google/Apple 的“嵌入式浏览器”风控，所以插件还提供**控制台模式**：由插件启动（或附着到）桌面上的真实 Chrome/Edge，用 CDP 远程调试协议驱动它。
+
+- 启动方式：工具调用 `webai{ action:'chrome', op:'start' }`，或点面板工具栏的「内嵌 / Chrome」切换按钮。
+- 登录：在弹出的真实 Chrome 窗口里登录 ChatGPT，**Google 登录可用**；登录态保存在独立配置目录 `%USERPROFILE%\.dsh\dsh-browser\chrome-profile`，**DSH 重启后仍然有效**，不用重登。
+- 调试端口：`127.0.0.1:9333`（只监听本机回环）。
+- 可用操作（`webai{action:'chrome', op:...}`）：
+
+| op | 作用 |
+|---|---|
+| `status` | 是否已连接、当前 URL/标题、最近转录与图片 |
+| `start` / `stop` | 启动/附着、断开控制（不关闭用户浏览器） |
+| `open` | 在真实浏览器中打开 URL |
+| `thread` / `last_reply` | 读取整段对话 / 最新一条 AI 回复（Markdown 原样保留，含代码块） |
+| `ask` | 填输入框、发送、等待新回复；**仍需面板审批** |
+| `images` | 抓取最新回复里的图片，作为附件回传给 DSH |
+| `screenshot` | 截取当前页面 |
+| `eval` | 在页面里执行一段只读诊断表达式（调试用，脚本本身不可信） |
+
+已知限制：需要本机装有 Chrome 或 Edge；控制台 UI 需要面板打开（命令轮询器在页面里）；`ask` 与主模式共用同一套审批与会话级“本会话都允许”。
+
 ## 审批
 
 `ask` 的三段式确认：
@@ -116,7 +138,7 @@ webai action=layout mode=right
 
 | 站点 | 选择器要点 |
 |---|---|
-| `chatgpt.com` / `chat.openai.com` | `[data-message-author-role]`、`#prompt-textarea`、`[data-testid="send-button"]` |
+| `chatgpt.com` / `chat.openai.com` | 新 UI：`[data-conversation-role]` + `.bubble-*` / `.MarkdownRoot-*`、`div[contenteditable="true"]`（旧 UI 回退 `[data-message-author-role]`、`#prompt-textarea`） |
 | `claude.ai` | `[data-testid="user-message"]` / `[data-testid="assistant-message"]`、`.ProseMirror` |
 | `gemini.google.com` | `<user-query>` / `<model-response>` |
 | `chat.deepseek.com` | `.ds-message` 行 + `.ds-assistant-message-main-content` 正文、`textarea[placeholder*="DeepSeek"]` |
@@ -198,6 +220,8 @@ cp client.js index.js package.json README.md \
 - `webai action=eval script="..."`：在网页里跑只读表达式，确认选择器是否命中。
 
 ## 已知限制
+
+- 控制台模式依赖本机 Chrome/Edge，且登录态绑定 `~/.dsh/dsh-browser/chrome-profile`。
 
 - 仅桌面端支持真嵌页；Web 端 `right` 模式会退化为 iframe，多数站点拒绝嵌入。
 - 重启 DSH 后网页 AI 需要重新登录（见「登录」）；跨会话持久化依赖上游支持。

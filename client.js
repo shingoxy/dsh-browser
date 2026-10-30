@@ -45,12 +45,32 @@ window.__ModuleLoader__.load({
     const DEFAULT_URL = 'https://chatgpt.com'
     // Google's sign-in flow rejects the Electron user agent inside a guest, so the panel presents
     // itself as a regular desktop Chrome to sites that gate on the UA.
-    const CHROME_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36'
+    // 用与引擎真实版本一致的 Chrome UA：UA 与 Client Hints 版本不一致会被 Google/OpenAI 的风控当成伪造。
+    const CHROMIUM_MAJOR = (() => {
+      const brands = navigator.userAgentData && navigator.userAgentData.brands
+      const c = Array.isArray(brands) && brands.find((b) => /Chromium/i.test(b.brand))
+      return c && /^\d+$/.test(c.version) ? c.version : '141'
+    })()
+    const CHROME_UA = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROMIUM_MAJOR}.0.0.0 Safari/537.36`
     const SIZE_KEY = 'dsh-browser.sizes.v1'
-    const VERSION = '0.2.8'
+    const LAUNCHER_KEY = 'dsh-browser.launcher.v1'
+    const VERSION = '0.3.4'
     const HELLO_PATH = 'dsh-browser/hello'
+    const CHROME_STATE_PATH = 'dsh-browser/chrome-state'
+    const CHROME_CMD_PATH = 'dsh-browser/chrome-cmd'
 
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+    // Never let one wedged guest call block the whole poller: a navigation during
+    // executeJavaScript can leave the promise pending forever.
+    function withTimeout(promise, ms, label) {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(label + ' timed out after ' + String(Math.round(ms / 1000)) + 's')), ms)
+        Promise.resolve(promise).then(
+          (value) => { clearTimeout(timer); resolve(value) },
+          (error) => { clearTimeout(timer); reject(error) },
+        )
+      })
+    }
 
     function safe(read) {
       try {
@@ -387,17 +407,27 @@ window.__ModuleLoader__.load({
         + (lastError instanceof Error && lastError.message ? ': ' + lastError.message : '. Open or reload the panel and retry.'))
     }
 
+    let lastRightTabId
+
     async function openRightTab(ctx, url) {
       const sidebarRight = sidebarRightOf(ctx)
       if (sidebarRight === undefined || sidebarRight === null) {
         throw new Error('The right Sidebar is unavailable in this Harness page. Use action "layout" with mode "bottom" instead.')
+      }
+      if (lastRightTabId !== undefined && typeof sidebarRight.close === 'function') {
+        safe(() => sidebarRight.close(lastRightTabId))
+        lastRightTabId = undefined
       }
       safe(() => sidebarRight.openTab('browser', { params: { url } }))
       const deadline = Date.now() + 20000
       while (Date.now() < deadline) {
         const tab = activeTabOf(ctx)
         const frame = (tab === undefined ? undefined : frameForTab(tab)) || browserFrames()[0]
-        if (frame !== undefined) return frame
+        if (frame !== undefined) {
+          const opened = activeTabOf(ctx)
+          if (opened !== undefined && opened !== null && opened.id !== undefined) lastRightTabId = opened.id
+          return frame
+        }
         await sleep(150)
       }
       throw new Error('The Browser tab was requested but no page appeared. Check that the built-in right-Sidebar Browser is enabled in this build.')
@@ -554,6 +584,18 @@ window.__ModuleLoader__.load({
       return Math.round(Number(guess) > 0 ? Number(guess) : 280)
     }
 
+    // DSH desktop keeps the window controls in a title bar above the frame; a top/left
+    // panel must start below it or it eats minimize/maximize/close.
+    function titleInsetOf(state) {
+      const parts = state.gridParts
+      const sidebar = parts && parts.sidebar
+      if (sidebar !== undefined && sidebar !== null && sidebar.isConnected) {
+        const top = Math.round(sidebar.getBoundingClientRect().top)
+        if (Number.isFinite(top) && top > 0 && top < 120) return top
+      }
+      return 0
+    }
+
     function positionPanelOver(state, edge, size, sbW) {
       const root = panelRootOf(state)
       if (root === undefined) return false
@@ -562,16 +604,17 @@ window.__ModuleLoader__.load({
       root.style.gridColumn = ''
       root.style.gridRow = ''
       root.style.zIndex = '2147483000'
+      const inset = titleInsetOf(state)
       if (edge === 'left') {
         root.style.left = sbW + 'px'
-        root.style.top = '0'
+        root.style.top = inset + 'px'
         root.style.right = 'auto'
         root.style.bottom = 'auto'
         root.style.width = Math.round(size) + 'px'
-        root.style.height = window.innerHeight + 'px'
+        root.style.height = Math.max(120, window.innerHeight - inset) + 'px'
       } else if (edge === 'top') {
         root.style.left = sbW + 'px'
-        root.style.top = '0'
+        root.style.top = inset + 'px'
         root.style.right = '0'
         root.style.bottom = 'auto'
         root.style.width = 'auto'
@@ -618,16 +661,17 @@ window.__ModuleLoader__.load({
       if (root === undefined) return 'no-root'
       const px = Math.round(size) + 'px'
       const offset = Math.round(sbGuess === undefined ? 0 : sbGuess)
+      const inset = titleInsetOf(state)
       root.style.position = 'fixed'
       if (edge === 'left') {
         root.style.left = offset + 'px'
-        root.style.top = '0'
+        root.style.top = inset + 'px'
         root.style.bottom = '0'
         root.style.width = px
       } else if (edge === 'top') {
         root.style.left = offset + 'px'
         root.style.right = '0'
-        root.style.top = '0'
+        root.style.top = inset + 'px'
         root.style.height = px
       } else {
         root.style.left = '0'
@@ -637,6 +681,32 @@ window.__ModuleLoader__.load({
       }
       attachRootTo(root, document.body)
       return 'overlay'
+    }
+
+    function launcherTopOf(state) {
+      if (Number.isFinite(state.launcherTop)) return state.launcherTop
+      const fallback = Math.round(window.innerHeight / 2 - 46)
+      try {
+        const raw = localStorage.getItem(LAUNCHER_KEY)
+        if (raw !== null) {
+          const parsed = JSON.parse(raw)
+          const top = Number(parsed && parsed.top)
+          if (Number.isFinite(top)) return clampLauncherTop(top)
+        }
+      } catch {}
+      return clampLauncherTop(fallback)
+    }
+
+    function clampLauncherTop(value) {
+      const min = 40
+      const max = Math.max(min + 40, window.innerHeight - 110)
+      return Math.round(Math.min(max, Math.max(min, Number(value) || min)))
+    }
+
+    function persistLauncherTop(state) {
+      try {
+        localStorage.setItem(LAUNCHER_KEY, JSON.stringify({ top: state.launcherTop }))
+      } catch {}
     }
 
     function persistSizes(state) {
@@ -706,6 +776,99 @@ window.__ModuleLoader__.load({
       resizers.bottom.style.display = mode === 'top' ? 'block' : 'none'
     }
 
+    function chromePost(path, payload) {
+      return fetch(new URL(path, document.baseURI), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify(payload || {}),
+      }).then((response) => response.json())
+    }
+
+    async function chromeRefresh(state) {
+      try {
+        const snapshot = await chromePost(CHROME_STATE_PATH, {})
+        state.chromeState = snapshot
+      } catch (error) {
+        state.chromeState = Object.assign({}, state.chromeState, { lastError: String(error && error.message ? error.message : error) })
+      }
+      renderChrome(state)
+    }
+
+    function renderChrome(state) {
+      if (state.panelChromeStatus === undefined) return
+      const snapshot = state.chromeState || {}
+      const running = snapshot.connected === true ? '已连接' : (snapshot.running === true ? '启动中' : '未启动')
+      state.panelChromeStatus.textContent = 'Chrome: ' + running
+        + (snapshot.url ? ' · ' + String(snapshot.url) : '')
+        + (snapshot.title ? ' · ' + String(snapshot.title).slice(0, 60) : '')
+        + (snapshot.lastError ? ' · 错误: ' + String(snapshot.lastError) : '')
+      const messages = Array.isArray(snapshot.transcript) ? snapshot.transcript : []
+      state.panelChromeLog.textContent = messages.length === 0
+        ? '（还没有读到对话。登录后在真实 Chrome 里聊天，或点“读取对话”。）'
+        : messages.map((message) => '[' + String(message.role) + ']\n' + String(message.text || '').slice(0, 1500)).join('\n\n---\n\n')
+      const images = Array.isArray(snapshot.images) ? snapshot.images : []
+      state.panelChromeImages.textContent = ''
+      for (const image of images.slice(-4)) {
+        if (typeof image.base64 !== 'string' || image.base64 === '') continue
+        const img = document.createElement('img')
+        img.src = 'data:' + String(image.mediaType || 'image/png') + ';base64,' + image.base64
+        Object.assign(img.style, { maxHeight: '120px', maxWidth: '180px', borderRadius: '6px', border: '1px solid rgba(148,163,184,.3)' })
+        state.panelChromeImages.append(img)
+      }
+    }
+
+    function chromeStartPoller(state) {
+      if (state.chromeTimer !== undefined) return
+      state.chromeTimer = setInterval(() => {
+        if (state.engine === 'chrome') void chromeRefresh(state)
+      }, 1500)
+    }
+
+    function chromeStopPoller(state) {
+      if (state.chromeTimer !== undefined) {
+        clearInterval(state.chromeTimer)
+        state.chromeTimer = undefined
+      }
+    }
+
+    function setEngine(state, engine) {
+      state.engine = engine === 'chrome' ? 'chrome' : 'embedded'
+      if (state.panelViewHost !== undefined) state.panelViewHost.style.display = state.engine === 'chrome' ? 'none' : ''
+      if (state.panelConsole !== undefined) state.panelConsole.style.display = state.engine === 'chrome' ? 'flex' : 'none'
+      if (state.panelEngine !== undefined) state.panelEngine.textContent = state.engine === 'chrome' ? 'Chrome' : '内嵌'
+      if (state.engine === 'chrome') {
+        chromeStartPoller(state)
+        void chromeRefresh(state)
+      } else {
+        chromeStopPoller(state)
+      }
+    }
+
+    async function chromeCommand(state, payload) {
+      try {
+        const result = await chromePost(CHROME_CMD_PATH, payload)
+        if (result && result.ok === false) state.chromeState = Object.assign({}, state.chromeState, { lastError: String(result.error || 'unknown') })
+        else state.chromeState = result && result.state ? result.state : state.chromeState
+      } catch (error) {
+        state.chromeState = Object.assign({}, state.chromeState, { lastError: String(error && error.message ? error.message : error) })
+      }
+      renderChrome(state)
+      return state.chromeState
+    }
+
+    async function sendChromeMessage(state) {
+      const box = state.panelChromePrompt
+      if (box === undefined) return
+      const text = String(box.value || '').trim()
+      if (text === '') return
+      const decision = await confirmInPanel(state, text)
+      if (decision.decision === 'deny') return
+      box.value = ''
+      state.chromeState = Object.assign({}, state.chromeState, { lastError: undefined })
+      void chromeCommand(state, { op: 'ask', prompt: text })
+    }
+
     function ensurePanelShell(state) {
       const existing = panelRootOf(state)
       if (existing !== undefined) return existing
@@ -766,8 +929,67 @@ window.__ModuleLoader__.load({
         pickers.push(button)
       }
       const reloadButton = panelButton(state, '\u5237\u65b0', () => { void state.onReload() })
+      const engineButton = panelButton(state, '\u5185\u5d4c', () => { setEngine(state, state.engine === 'chrome' ? 'embedded' : 'chrome') })
+      engineButton.title = '\u5185\u5d4c webview \u4e0e\u771f\u5b9e Chrome \u6a21\u5f0f\u5207\u6362'
       const closeButton = panelButton(state, '\u5173\u95ed', () => { void state.onClose() })
-      bar.append(title, input, openButton, ...pickers, reloadButton, closeButton)
+      bar.append(title, engineButton, input, openButton, ...pickers, reloadButton, closeButton)
+      const consoleEl = document.createElement('div')
+      consoleEl.setAttribute('data-dsh-browser-chrome', '')
+      Object.assign(consoleEl.style, {
+        display: 'none',
+        flexDirection: 'column',
+        flex: '1',
+        minHeight: '0',
+        gap: '8px',
+        padding: '8px',
+      })
+      const chromeStatus = document.createElement('div')
+      chromeStatus.setAttribute('data-dsh-browser-chrome-status', '')
+      Object.assign(chromeStatus.style, { fontSize: '12px', opacity: '.85', wordBreak: 'break-all' })
+      const chromeActions = document.createElement('div')
+      Object.assign(chromeActions.style, { display: 'flex', gap: '6px', flexWrap: 'wrap' })
+      const chromeLog = document.createElement('pre')
+      Object.assign(chromeLog.style, {
+        flex: '1',
+        minHeight: '80px',
+        overflow: 'auto',
+        margin: '0',
+        padding: '8px',
+        whiteSpace: 'pre-wrap',
+        wordBreak: 'break-word',
+        background: 'rgba(148,163,184,.10)',
+        border: '1px solid rgba(148,163,184,.22)',
+        borderRadius: '6px',
+        font: '12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace',
+      })
+      const chromeImages = document.createElement('div')
+      Object.assign(chromeImages.style, { display: 'flex', gap: '6px', flexWrap: 'wrap' })
+      const chromePromptRow = document.createElement('div')
+      Object.assign(chromePromptRow.style, { display: 'flex', gap: '6px', alignItems: 'flex-end' })
+      const chromePrompt = document.createElement('textarea')
+      chromePrompt.placeholder = '给真实 Chrome 里的网页 AI 发一条消息（会先请你确认）'
+      chromePrompt.rows = 2
+      Object.assign(chromePrompt.style, {
+        flex: '1',
+        resize: 'vertical',
+        minHeight: '38px',
+        background: 'rgba(148,163,184,.12)',
+        color: 'inherit',
+        border: '1px solid rgba(148,163,184,.3)',
+        borderRadius: '5px',
+        padding: '4px 8px',
+        font: 'inherit',
+      })
+      chromeActions.append(
+        panelButton(state, '启动 Chrome', () => { void chromeCommand(state, { op: 'start' }) }),
+        panelButton(state, '停止', () => { void chromeCommand(state, { op: 'stop' }) }),
+        panelButton(state, '打开地址', () => { void chromeCommand(state, { op: 'open', url: state.panelInput !== undefined ? state.panelInput.value : DEFAULT_URL }) }),
+        panelButton(state, '读取对话', () => { void chromeCommand(state, { op: 'thread' }) }),
+        panelButton(state, '取图片', () => { void chromeCommand(state, { op: 'images' }) }),
+      )
+      chromePromptRow.append(chromePrompt, panelButton(state, '发送', () => { void sendChromeMessage(state) }))
+      consoleEl.append(chromeStatus, chromeActions, chromeLog, chromeImages, chromePromptRow)
+
       const viewHost = document.createElement('div')
       viewHost.setAttribute('data-dsh-browser-view-host', '')
       Object.assign(viewHost.style, {
@@ -777,7 +999,7 @@ window.__ModuleLoader__.load({
         minHeight: '0',
         minWidth: '0',
       })
-      root.append(bar, viewHost)
+      root.append(bar, viewHost, consoleEl)
       const resizers = {
         top: makeResizer(state, 'top'),
         right: makeResizer(state, 'right'),
@@ -790,6 +1012,12 @@ window.__ModuleLoader__.load({
       state.panelInput = input
       state.panelViewHost = viewHost
       state.panelPickers = pickers
+      state.panelConsole = consoleEl
+      state.panelEngine = engineButton
+      state.panelChromeStatus = chromeStatus
+      state.panelChromeLog = chromeLog
+      state.panelChromeImages = chromeImages
+      state.panelChromePrompt = chromePrompt
       return root
     }
 
@@ -855,6 +1083,8 @@ window.__ModuleLoader__.load({
     }
 
     async function disposePanel(state) {
+      chromeStopPoller(state)
+      setEngine(state, 'embedded')
       clearFrameShift(state)
       if (typeof state.panelOpenUnsub === 'function') {
         try {
@@ -1474,7 +1704,7 @@ window.__ModuleLoader__.load({
           let view = targetOf(state, ctx)
           if (view === undefined) view = await openPanelPage(state, ctx, evalUrl, {})
           await frameReady(view, 20000)
-          const result = await view.executeJavaScript(scriptArg, true)
+          const result = await withTimeout(view.executeJavaScript(scriptArg, true), 20000, 'eval')
           const shown = typeof result === 'string' ? result : JSON.stringify(result, null, 2)
           const liveUrl = String(safe(() => view.getURL()) || evalUrl)
           return { text: 'evaluated: ' + liveUrl + '\n' + String(shown).slice(0, 20000) }
@@ -1492,6 +1722,10 @@ window.__ModuleLoader__.load({
             return { text: 'Closed the Browser tab ' + String(tab.id) + '.' }
           }
           return { text: 'There was no embedded web AI panel to close.' }
+        }
+        case 'approval': {
+          const decision = await confirmInPanel(state, String(command.args && command.args.prompt || ''))
+          return { text: '', approved: decision.decision !== 'deny' }
         }
         default:
           throw new Error('Unsupported action ' + JSON.stringify(command.action))
@@ -1514,6 +1748,9 @@ window.__ModuleLoader__.load({
         running: true,
         mode: 'right',
         sessionApproved: false,
+        engine: 'embedded',
+        chromeState: undefined,
+        chromeTimer: undefined,
         panelRoot: undefined,
         panelView: undefined,
         panelLease: undefined,
@@ -1669,7 +1906,8 @@ window.__ModuleLoader__.load({
               if (signal.aborted || state.running === false) return
               let message
               try {
-                const value = await executeCommand(state, ctx, command)
+                const budget = command.action === 'ask' ? 300000 : 90000
+                const value = await withTimeout(executeCommand(state, ctx, command), budget, String(command.action))
                 const audit = value && value.audit !== undefined ? value.audit : undefined
                 const payloadValue = value && value.audit !== undefined ? { ...value, audit: undefined } : value
                 message = { ok: true, value: JSON.parse(JSON.stringify(payloadValue)) }
@@ -1777,30 +2015,73 @@ window.__ModuleLoader__.load({
       ctx.effect(() => registerBottomSlot(), 'dsh-browser: bottom split slot')
 
       function Launcher() {
+        const [top, setTop] = React.useState(() => launcherTopOf(state))
+        const drag = React.useRef(null)
+        const moved = React.useRef(false)
+
+        React.useEffect(() => {
+          const onResize = () => setTop(clampLauncherTop(top))
+          window.addEventListener('resize', onResize)
+          return () => window.removeEventListener('resize', onResize)
+        }, [top])
+
+        const onPointerDown = (event) => {
+          if (event.button !== undefined && event.button !== 0) return
+          event.preventDefault()
+          moved.current = false
+          const startY = event.clientY
+          const startTop = launcherTopOf(state)
+          drag.current = { startY, startTop, pointerId: event.pointerId }
+
+          const onMove = (moveEvent) => {
+            const dy = moveEvent.clientY - startY
+            if (Math.abs(dy) > 3) moved.current = true
+            const next = clampLauncherTop(startTop + dy)
+            state.launcherTop = next
+            setTop(next)
+          }
+          const onUp = () => {
+            window.removeEventListener('pointermove', onMove)
+            window.removeEventListener('pointerup', onUp)
+            window.removeEventListener('pointercancel', onUp)
+            drag.current = null
+            persistLauncherTop(state)
+          }
+          window.addEventListener('pointermove', onMove)
+          window.addEventListener('pointerup', onUp)
+          window.addEventListener('pointercancel', onUp)
+        }
+
+        const onClick = (event) => {
+          event.preventDefault()
+          event.stopPropagation()
+          if (moved.current) {
+            moved.current = false
+            return
+          }
+          void (async () => {
+            try {
+              if (panelRootOf(state) !== undefined) await closePanel(state)
+              else {
+                state.mode = state.mode === 'right' ? 'bottom' : (state.mode || 'bottom')
+                await openPanelPage(state, ctx, state.lastUrl || state.lastPanelUrl || DEFAULT_URL)
+                collapseRightColumn(ctx)
+              }
+            } catch (error) {
+              console.error('[dsh-browser] launcher failed', error)
+            }
+          })()
+        }
+
         return React.createElement('button', {
           'data-dsh-browser-launcher': '',
-          title: '浏览器分屏：打开 / 关闭网页 AI',
-          onClick: (event) => {
-            event.preventDefault()
-            event.stopPropagation()
-            void (async () => {
-              try {
-                if (panelRootOf(state) !== undefined) await closePanel(state)
-                else {
-                  state.mode = state.mode === 'right' ? 'bottom' : (state.mode || 'bottom')
-                  await openPanelPage(state, ctx, state.lastUrl || state.lastPanelUrl || DEFAULT_URL)
-                  collapseRightColumn(ctx)
-                }
-              } catch (error) {
-                console.error('[dsh-browser] launcher failed', error)
-              }
-            })()
-          },
+          title: '浏览器分屏：打开 / 关闭网页 AI（可上下拖动）',
+          onClick,
+          onPointerDown,
           style: {
             position: 'fixed',
             right: '0px',
-            top: '50%',
-            transform: 'translateY(-50%)',
+            top: top + 'px',
             zIndex: '2147483100',
             width: '22px',
             height: '92px',
@@ -1813,7 +2094,9 @@ window.__ModuleLoader__.load({
             font: '600 10px/1.1 system-ui, -apple-system, Segoe UI, sans-serif',
             letterSpacing: '.08em',
             writingMode: 'vertical-rl',
-            cursor: 'pointer',
+            cursor: 'grab',
+            touchAction: 'none',
+            userSelect: 'none',
             opacity: '0.82',
             boxShadow: '-6px 0 18px rgba(0,0,0,.28)',
           },
